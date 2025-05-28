@@ -7,139 +7,64 @@ library(streamMetabolizer)
 library(tidyverse)
 library(lubridate)
 
-bpcalc_atm<- function(bpst, alt) {
-  bpst*exp((-9.80665*0.0289644*alt)/(8.31447*(273.15+15)))
-}
-bpcalc_atm(bpst=bpstd, alt=altitude)
 
 
-spring17<- read.csv("/Users/bob.hall/Dropbox/met_error_models/metabolism process error/spring_june17.csv")
-oxy<-spring17
-lat<- 41.304
-long<- -105.5676 #(note - for us folks in western hemisphere)
-altitude<- 7200/3.28 # m asl
-bpstd <- 1013 #Do not change. ignoring weather relate changes in bp for this minimal code.  1013 mb = 760 mm Hg.  
-K600_guess <- 30 #your best guess of K600 in units of 1/d.  Big slow rivers, 0.5 to 2.  Medium slow rivers, 2-10. 
-#Fun rivers to float 10-20.  Non bubbly streams 20-40.  Bubbly streams 50-200.
-mean_depth <- 0.2 # knowing mean river depth (m) is not important for code testing, but it sure is important if you want to publish meaningful estimates of metabolis,m
-oxy$time<-as_datetime(oxy$unixtime) #converts unit time to a R time object in UTC
-oxy$solar.time<-convert_UTC_to_solartime(oxy$time, longitude= long, time.type="mean solar")
-oxy$light<- calc_light(oxy$solar.time, latitude=lat, longitude=long, max.PAR =2326, attach.units = F)
-oxy$osat<- calc_DO_sat(temp.water=oxy$temp, pressure.air=bpcalc_atm(bpst=bpstd, alt=altitude))
 
-head(oxy)
+##gallatin, uses "oxy_g" from data script
+
+gall_metab_list<- list(T=ntime*nday, D=nday, y=oxy_g$oxy, light=oxy_g$light,oxysat=oxy_g$osat,day=oxy_g$day,
+                       Kc=oxy_g$Kc,sumlight=colSums(matrix(oxy_g$light, nrow=ntime)), z=mean_depth, ts=1/ntime   )
 
 
-plot(oxy$solar.time,oxy$oxy)
-
-model_name <- mm_name(type='bayes', pool_K600='normal', err_obs_iid = T, err_proc_iid =T)
-model_specs <- specs(model_name, K600_daily_meanlog_meanlog=log(K600_guess), K600_daily_meanlog_sdlog=0.7, K600_daily_sdlog_sigma=0.05, burnin_steps=1000, 
-                     saved_steps=1000) 
-
-### Make your data frame
-
-data_sm<-data.frame(DO.obs=oxy$oxy, DO.sat=oxy$osat, 
-                    temp.water=oxy$temp, depth=rep(mean_depth,length(oxy$oxy)), 
-                    light=oxy$light, solar.time=oxy$solar.time)
-
-head(data_sm) #always take a look at the dataframe!
-
-
-fit <- metab(model_specs, data=data_sm, info=c(site='spring creek', source='Hall'))
-#fit_oipi<-fit
-#fit_pi<-fit
-
-plot_DO_preds(predict_DO(fit))
-plot_metab_preds(predict_metab(fit))
-params<- get_params(fit , uncertainty='ci')
-
-plot(params$K600.daily,params$ER.daily) #if these covary, then equifinality warning!  Indeed my data have that.
-
-mcmc_oipi<-get_mcmc(fit_oipi)
-fit_check<-get_fit(fit_oipi)$overall
-get_fit(fit_oipi)$overall %>%
-  select(ends_with('Rhat'))
-
-print(mcmc_oipi, pars="K600_daily_sdlog")
-
-rstan::stanmodel(mcmc_oipi)
-
-
-mean(params$GPP.daily, na.rm=T)
-mean(params$ER.daily, na.rm=T)
 
 
 ########
-#homemade stan model
-oxy_s<-oxy[oxy$time > ymd_hms("2017-06-01 11:01:00 ") & oxy$time < ymd_hms("2017-06-30 11:01:00 "), ]
-Kcor<-function (temp,K600) {
-  K600/(600/(1800.6-(temp*120.1)+(3.7818*temp^2)-(0.047608*temp^3)))^-0.5
-}
-oxy_s$Kc<-Kcor(oxy_s$temp,1)
-  
-  
-ntime<-144
-nday<-length(oxy_s$oxy)/ntime
-spring_metab_list<- list(T=ntime, D=nday, y=matrix(oxy_s$oxy, nrow=ntime), light=matrix(oxy_s$light, nrow=ntime),oxysat=matrix(oxy_s$osat, nrow=ntime),
-                         Kc=matrix(oxy_s$Kc, nrow=ntime),sumlight=colSums(matrix(oxy_s$light, nrow=ntime)), z=mean_depth, ts=1/ntime   )
+####process error models.
 
 
+procfit<- stan(file= "metab_pi_2.stan", data=gall_metab_list_long,  iter = 2000, chains = 4)
+print(procfit, pars=c("GPP","ER","K", "Ksd", "Kmean", "sigproc" ) , digits=3) 
 
-####  State space
-oipi_fit<- stan(file= "metab_oipi.stan", data=spring_metab_list,  iter = 2000, chains = 4)
-
-
-print(oipi_fit, pars=c("GPP","ER","K", "Ksd", "sigproc", "sigobs" ) ) 
-  ###
-gpp_est<- summary(oipi_fit, pars = c("GPP"), probs = 0.5)$summary
-K_est<- summary(oipi_fit, pars = c("K"), probs = 0.5)$summary
-
-plot(params$GPP.daily[2:30], gpp_est[,1])
-plot(params$K600.daily[2:30], K_est[,1])
-
-
-mu_summary <- summary(oipi_fit, pars = c("mu"), probs = c(0.5))$summary
-pred_mu<- mu_summary[,1]
-oxymat<-matrix(oxy_s$oxy, nrow=ntime)
-
-ypred_summary <- summary(oipi_fit, pars = c("ypred"), probs = c(0.5))$summary
-pred_ypred<- ypred_summary[,1]
-
-
-plot(pred_mu,pred_ypred)
-
-
-####  State space with AR error on state
-oipi_ar_fit<- stan(file= "metab_oipi_ar.stan", data=spring_metab_list,  iter = 2000, chains = 4)
-
-
-print(oipi_ar_fit, pars=c("GPP","ER","K", "Ksd", "sigproc", "sigobs" ) ) 
-###
-gpp_est<- summary(oipi_ar_fit, pars = c("GPP"), probs = 0.5)$summary
-K_est<- summary(oipi_ar_fit, pars = c("K"), probs = 0.5)$summary
-
-plot(params$GPP.daily[2:30], gpp_est[,1])
-plot(params$K600.daily[2:30], K_est[,1])
+K_est_procfit<- summary(procfit, pars = c("K"), probs = 0.5)$summary
+gpp_est_procfit<- summary(procfit, pars = c("GPP"), probs = 0.5)$summary
+er_est_procfit<- summary(procfit, pars = c("ER"), probs = 0.5)$summary
 
 
 
 
-
-
-####process error only.  
-procfit<- stan(file= "metab_pi.stan", data=spring_metab_list,  iter = 2000, chains = 4)
-print(procfit, pars=c("GPP","ER","K", "Ksd", "Kmean", "sigproc" ) ) 
-
-
-gpp_est<- summary(procfit, pars = c("GPP"), probs = 0.5)$summary
-K_est<- summary(procfit, pars = c("K"), probs = 0.5)$summary
-
-plot(params$GPP.daily[2:30], gpp_est[,1])
-plot(params$K600.daily[2:30], K_est[,1])
-
+###summaries for procfit
 mu_summary <- summary(procfit, pars = c("mu"), probs = c(0.5))$summary
 pred_mu<- mu_summary[,1]
-oxymat<-matrix(oxy_s$oxy, nrow=ntime)
+
+
+ypred_summary <- summary(procfit, pars = c("ypred"), probs = c(0.5))$summary
+pred_ypred<- ypred_summary[,1]
+
+eta_summary <- summary(procfit, pars = c("eta"), probs = c(0.5))$summary
+pred_eta<- eta_summary[,1]
+
+acf(pred_eta)
+acf(pred_eta[1:144])
+
+plot(oxy_g$solar.time, oxy_g$oxy, pch=16, cex=0.5, col="orange")
+lines(oxy_g$solar.time, pred_ypred)
+
+plot(diff(oxy_g$oxy), pch=16, cex=0.5, col="orange")
+lines(diff(pred_mu))
+lines(diff(pred_ypred))
+
+
+###
+#process error plots
+par(mfrow=c(2,1), mai=c(0.65,0.7,0.1,0.1), mgp=c(2,1,0))
+plot(K_est[,1], gpp_est[,1], pch=16, ylim=c(0,8), xlim=c(20,50), xlab="K (1/d)", ylab = (expression(paste('GPP (g O'[2] ~m^-2, ~d^-1,')')))   )
+plot(K_est[,1], er_est[,1], pch=16, ylim=c(-15,-4), xlim=c(20,50), xlab="K (1/d)", ylab = (expression(paste('ER (g O'[2] ~m^-2, ~d^-1,')')))   )
+
+sqrt(mean((oxy_g$oxy - pred_ypred)^2))
+
+
+
+##process error models working great, stick with them
 
 
 
@@ -147,24 +72,184 @@ oxymat<-matrix(oxy_s$oxy, nrow=ntime)
 ###########
 
 
+
+##Process error with AR term
  
-procarfit<- stan(file= "metab_pi_ar.stan", data=spring_metab_list,  iter = 2000, chains = 4)
-print(procarfit, pars=c("GPP","ER","K", "Kmean", "Ksd", "sigproc", "phi" ) ) 
+#procarfit<- stan(file= "metab_pi_ar.stan", data=spring_metab_list,  iter = 2000, chains = 4)
+procarfit<- stan(file= "metab_pi_ar_2.stan", data=gall_metab_list,  iter = 2000, chains = 4)
+ print(procarfit, pars=c("GPP","ER","K", "Kmean", "Ksd", "sigproc", "phi" ), digits=3 ) 
 
 
-###ARCH tries
+gpp_est_procar<- summary(procarfit, pars = c("GPP"), probs = 0.5)$summary
+ER_est_procar<- summary(procarfit, pars = c("ER"), probs = 0.5)$summary
+K_est_procar<- summary(procarfit, pars = c("K"), probs = 0.5)$summary
 
-alpha_0<- 0.00036
-alpha_1<-1.74
-y<-0
-for (i in 2:150){
-  
-  y[i]<- rnorm(1,0,(alpha_0+alpha_1*y[i-1]^2)^0.5)
-  
-}
 
-plot(y, type='o')
+plot(gpp_est[,1], gpp_est_procar[,1])
+lines(gpp_est[,1],gpp_est[,1])
 
-procarchfit<- stan(file= "metab_pi_arch.stan", data=spring_metab_list,  iter = 2000, chains = 4)
-print(procarchfit, pars=c("GPP","ER","K", "Kmean", "Ksd", "alpha_0", "alpha_1" ) ) 
+plot(K_est[,1], K_est_procar[,1])
+lines(K_est[,1],K_est[,1])
+
+plot(K_est_procar[,1], ER_est_procar[,1])
+
+par(mfrow=c(2,1), mai=c(0.65,0.7,0.1,0.1), mgp=c(2,1,0))
+plot(K_est_procar[,1],  gpp_est_procar[,1], pch=16, ylim=c(0,8), xlim=c(20,50), xlab="K (1/d)", ylab = (expression(paste('GPP (g O'[2] ~m^-2, ~d^-1,')')))   )
+plot(K_est_procar[,1],  ER_est_procar[,1], pch=16, ylim=c(-15,-4), xlim=c(20,50), xlab="K (1/d)", ylab = (expression(paste('ER (g O'[2] ~m^-2, ~d^-1,')')))   )
+
+
+
+# mu_summary_procar <- summary(procarfit, pars = c("mu"), probs = c(0.5))$summary
+pred_mu_procar<- mu_summary_procar[,1]
+
+ypred_summary_procar <- summary(procarfit, pars = c("ypred"), probs = c(0.5))$summary
+pred_ypred_procar<- ypred_summary_procar[,1]
+
+eta_summary_procar <- summary(procarfit, pars = c("eta"), probs = c(0.5))$summary
+pred_eta_procar<- eta_summary_procar[,1]
+
+plot(oxy_g$solar.time, oxy_g$oxy, pch=16, cex=0.5, col="orange")
+lines(oxy_g$solar.time, pred_ypred_procar)
+
+
+acf(pred_eta_procar)
+acf(pred_eta_procar[1:144])
+
+sqrt(mean((oxy_g$oxy - pred_ypred_procar)^2))
+
+
+
+
+
+####Light and AR process error models.
+
+
+procar_light_fit<- stan(file= "metab_pi_ar_light_2.stan", data=gall_metab_list,  iter = 2000, chains = 4)
+
+print(procar_light_fit, pars=c("GPP","ER","K", "Kmean", "Ksd","phi", "alpha", "sigproc" ) ) 
+
+
+gpp_est_procar_light<- summary(procar_light_fit, pars = c("GPP"), probs = 0.5)$summary
+ER_est_procar_light<- summary(procar_light_fit, pars = c("ER"), probs = 0.5)$summary
+K_est_procar_light<- summary(procar_light_fit, pars = c("K"), probs = 0.5)$summary
+
+
+
+plot(K_est_procar_light[,1], ER_est_procar_light[,1])
+
+
+mu_summary_procar_light <- summary(procar_light_fit, pars = c("mu"), probs = c(0.5))$summary
+pred_mu_procar_light<- mu_summary_procar_light[,1]
+
+ypred_summary_procar_light <- summary(procar_light_fit, pars = c("ypred"), probs = c(0.5))$summary
+pred_ypred_procar_light<- ypred_summary_procar_light[,1]
+
+eta_summary_procar_light <- summary(procar_light_fit, pars = c("eta"), probs = c(0.5))$summary
+pred_eta_proca_light<- eta_summary_procar_light[,1]
+
+
+par(mfrow=c(2,1), mai=c(0.65,0.7,0.1,0.1), mgp=c(2,1,0))
+plot(K_est_procar_light[,1],  gpp_est_procar_light[,1], pch=16, ylim=c(0,8), xlim=c(20,50), xlab="K (1/d)", ylab = (expression(paste('GPP (g O'[2] ~m^-2, ~d^-1,')')))   )
+plot(K_est_procar_light[,1],  ER_est_procar_light[,1], pch=16, ylim=c(-15,-4), xlim=c(20,50), xlab="K (1/d)", ylab = (expression(paste('ER (g O'[2] ~m^-2, ~d^-1,')')))   )
+
+sqrt(mean((oxy_g$oxy - pred_ypred_procar_light)^2))
+
+
+
+####Spring Creek
+
+spring_metab_list<- list(T=ntime*nday, D=nday, y=oxy_s$oxy, light=oxy_s$light,oxysat=oxy_s$osat,day=oxy_s$day,
+                       Kc=oxy_s$Kc,sumlight=colSums(matrix(oxy_s$light, nrow=ntime)), z=spring_mean_depth, ts=1/ntime   )
+
+
+
+procfit<- stan(file= "metab_pi_2.stan", data=spring_metab_list,  iter = 2000, chains = 4)
+ print(procfit, pars=c("GPP","ER","K", "Ksd", "Kmean", "sigproc" ) , digits=3) 
+
+K_est_procfit<- summary(procfit, pars = c("K"), probs = 0.5)$summary
+gpp_est_procfit<- summary(procfit, pars = c("GPP"), probs = 0.5)$summary
+er_est_procfit<- summary(procfit, pars = c("ER"), probs = 0.5)$summary
+
+
+
+
+###summaries for procfit
+mu_summary <- summary(procfit, pars = c("mu"), probs = c(0.5))$summary
+pred_mu<- mu_summary[,1]
+
+
+ypred_summary <- summary(procfit, pars = c("ypred"), probs = c(0.5))$summary
+pred_ypred<- ypred_summary[,1]
+
+eta_summary <- summary(procfit, pars = c("eta"), probs = c(0.5))$summary
+pred_eta<- eta_summary[,1]
+
+acf(pred_eta)
+acf(pred_eta[1:144])
+
+plot(oxy_g$solar.time, oxy_g$oxy, pch=16, cex=0.5, col="orange")
+lines(oxy_g$solar.time, pred_ypred)
+
+plot(diff(oxy_g$oxy), pch=16, cex=0.5, col="orange")
+lines(diff(pred_mu))
+lines(diff(pred_ypred))
+
+
+###
+#process error plots
+par(mfrow=c(2,1), mai=c(0.65,0.7,0.1,0.1), mgp=c(2,1,0))
+plot(K_est[,1], gpp_est[,1], pch=16, ylim=c(0,8), xlim=c(20,50), xlab="K (1/d)", ylab = (expression(paste('GPP (g O'[2] ~m^-2, ~d^-1,')')))   )
+plot(K_est[,1], er_est[,1], pch=16, ylim=c(-15,-4), xlim=c(20,50), xlab="K (1/d)", ylab = (expression(paste('ER (g O'[2] ~m^-2, ~d^-1,')')))   )
+
+sqrt(mean((oxy_s$oxy - pred_ypred)^2))
+
+
+##Process error with AR term
+
+procarfit<- stan(file= "metab_pi_ar_2.stan", data=spring_metab_list,  iter = 2000, chains = 4)
+
+print(procarfit, pars=c("GPP","ER","K", "Kmean", "Ksd", "sigproc", "phi" ), digits=3 ) 
+
+
+gpp_est_procar<- summary(procarfit, pars = c("GPP"), probs = 0.5)$summary
+ER_est_procar<- summary(procarfit, pars = c("ER"), probs = 0.5)$summary
+K_est_procar<- summary(procarfit, pars = c("K"), probs = 0.5)$summary
+
+
+plot(gpp_est[,1], gpp_est_procar[,1])
+lines(gpp_est[,1],gpp_est[,1])
+
+plot(K_est[,1], K_est_procar[,1])
+lines(K_est[,1],K_est[,1])
+
+plot(K_est_procar[,1], ER_est_procar[,1])
+
+par(mfrow=c(2,1), mai=c(0.65,0.7,0.1,0.1), mgp=c(2,1,0))
+plot(K_est_procar[,1],  gpp_est_procar[,1], pch=16, ylim=c(0,8), xlim=c(20,50), xlab="K (1/d)", ylab = (expression(paste('GPP (g O'[2] ~m^-2, ~d^-1,')')))   )
+plot(K_est_procar[,1],  ER_est_procar[,1], pch=16, ylim=c(-15,-4), xlim=c(20,50), xlab="K (1/d)", ylab = (expression(paste('ER (g O'[2] ~m^-2, ~d^-1,')')))   )
+
+
+
+# mu_summary_procar <- summary(procarfit, pars = c("mu"), probs = c(0.5))$summary
+pred_mu_procar<- mu_summary_procar[,1]
+
+ypred_summary_procar <- summary(procarfit, pars = c("ypred"), probs = c(0.5))$summary
+pred_ypred_procar<- ypred_summary_procar[,1]
+
+eta_summary_procar <- summary(procarfit, pars = c("eta"), probs = c(0.5))$summary
+pred_eta_procar<- eta_summary_procar[,1]
+
+plot(oxy_g$solar.time, oxy_g$oxy, pch=16, cex=0.5, col="orange")
+lines(oxy_g$solar.time, pred_ypred_procar)
+
+
+acf(pred_eta_procar)
+acf(pred_eta_procar[1:144])
+
+sqrt(mean((oxy_g$oxy - pred_ypred_procar)^2))
+
+
+
+
+
 
